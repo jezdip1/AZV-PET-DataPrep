@@ -1,0 +1,45 @@
+#!/bin/bash
+FILES="./*.nii"
+for f in $FILES
+do
+  echo "running BRAINSFit on ${f}"
+  /home/jezdip1/Slicer-5.8.0-linux-amd64/Slicer --launch BRAINSFit \
+  --fixedVolume /home/jezdip1/ISARGUBU/media/shared_storage/motol/AZV_PET/normy/nii/only_PETs/stripped/MNIGMS.nii \
+  --movingVolume $f \
+  --samplingPercentage 0.01 \
+  --splineGridSize 14,10,12 \
+  --outputVolume "${f::-4}_affine_reg.nii" \
+  --initializeTransformMode useCenterOfHeadAlign \
+  --useAffine \
+  --maskProcessingMode NOMASK \
+  --medianFilterSize 0,0,0 \
+  --removeIntensityOutliers 0 \
+  --outputVolumePixelType float \
+  --backgroundFillValue 0 \
+  --interpolationMode Linear \
+  --numberOfIterations 1500 \
+  --maximumStepLength 0.05 \
+  --minimumStepLength 0.001 \
+  --relaxationFactor 0.5 \
+  --translationScale 1000 \
+  --reproportionScale 1 \
+  --skewScale 1 \
+  --maxBSplineDisplacement 0 \
+  --fixedVolumeTimeIndex 0 \
+  --movingVolumeTimeIndex 0 \
+  --numberOfHistogramBins 50 \
+  --numberOfMatchPoints 10 \
+  --costMetric MMI \
+  --maskInferiorCutOffFromCenter 1000 \
+  --ROIAutoDilateSize 0 \
+  --ROIAutoClosingSize 9 \
+  --numberOfSamples 0 \
+  --failureExitCode -1 \
+  --numberOfThreads -1 \
+  --debugLevel 7 \
+  --costFunctionConvergenceFactor 2e+13 \
+  --projectedGradientTolerance 1e-05 \
+  --maximumNumberOfEvaluations 900 \
+  --maximumNumberOfCorrections 25 \
+  --metricSamplingStrategy Random 
+done

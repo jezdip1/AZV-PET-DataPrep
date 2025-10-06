@@ -1,0 +1,19 @@
+# Copy to config/paths.yaml and edit to your environment
+slicer:
+  dicom_db: /path/to/SlicerDICOMDatabase
+  exec: /path/to/Slicer-5.8.0-linux-amd64/Slicer
+
+atlases:
+  labels_csv: ./atlases/CerebrA_LabelDetails.csv
+  seg_nifti:  ./atlases/mni_icbm152_CerebrA_tal_nlin_sym_09c_expanded.nii
+
+io:
+  metadata_csv: ./outputs/metadata/all_series_metadata.csv
+  nii_raw_dir:  ./outputs/nii/raw
+  nii_strip_dir: ./outputs/nii/stripped
+  nii_mni_dir:  ./outputs/nii/mni_affine
+  region_csv:   ./outputs/tables/region_medians_mni_affine.csv
+
+options:
+  threshold: 5000
+  pediatric_id_has_slash: false

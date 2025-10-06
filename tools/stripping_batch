@@ -1,0 +1,9 @@
+#!/bin/bash
+# NOTE : Quote it else use array to avoid problems #
+FILES="./*.nii"
+for f in $FILES
+do
+  echo "running ./synthstrip-docker -i ${f} -o ${f::-4}_stripped.nii"
+  # take action on each file. $f store current file name
+  ./synthstrip-docker -i $f -o "${f::-4}_stripped.nii"
+done

@@ -1,0 +1,23 @@
+# --- Patient or generated data ---
+outputs/**
+!outputs/.gitkeep
+!outputs/metadata/.gitkeep
+!outputs/nii/.gitkeep
+!outputs/nii/raw/.gitkeep
+!outputs/nii/stripped/.gitkeep
+!outputs/nii/mni_affine/.gitkeep
+!outputs/tables/.gitkeep
+!outputs/logs/.gitkeep
+
+# --- NIfTI / transforms (safety) ---
+*.nii
+*.nii.gz
+*.mat
+*.h5
+
+# --- Configs ---
+config/paths.yaml
+
+# --- Python cache ---
+__pycache__/
+*.pyc
