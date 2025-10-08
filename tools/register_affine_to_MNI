@@ -1,45 +1,195 @@
-#!/bin/bash
-FILES="./*.nii"
-for f in $FILES
-do
-  echo "running BRAINSFit on ${f}"
-  /home/jezdip1/Slicer-5.8.0-linux-amd64/Slicer --launch BRAINSFit \
-  --fixedVolume /home/jezdip1/ISARGUBU/media/shared_storage/motol/AZV_PET/normy/nii/only_PETs/stripped/MNIGMS.nii \
-  --movingVolume $f \
-  --samplingPercentage 0.01 \
-  --splineGridSize 14,10,12 \
-  --outputVolume "${f::-4}_affine_reg.nii" \
-  --initializeTransformMode useCenterOfHeadAlign \
-  --useAffine \
-  --maskProcessingMode NOMASK \
-  --medianFilterSize 0,0,0 \
-  --removeIntensityOutliers 0 \
-  --outputVolumePixelType float \
-  --backgroundFillValue 0 \
-  --interpolationMode Linear \
-  --numberOfIterations 1500 \
-  --maximumStepLength 0.05 \
-  --minimumStepLength 0.001 \
-  --relaxationFactor 0.5 \
-  --translationScale 1000 \
-  --reproportionScale 1 \
-  --skewScale 1 \
-  --maxBSplineDisplacement 0 \
-  --fixedVolumeTimeIndex 0 \
-  --movingVolumeTimeIndex 0 \
-  --numberOfHistogramBins 50 \
-  --numberOfMatchPoints 10 \
-  --costMetric MMI \
-  --maskInferiorCutOffFromCenter 1000 \
-  --ROIAutoDilateSize 0 \
-  --ROIAutoClosingSize 9 \
-  --numberOfSamples 0 \
-  --failureExitCode -1 \
-  --numberOfThreads -1 \
-  --debugLevel 7 \
-  --costFunctionConvergenceFactor 2e+13 \
-  --projectedGradientTolerance 1e-05 \
-  --maximumNumberOfEvaluations 900 \
-  --maximumNumberOfCorrections 25 \
-  --metricSamplingStrategy Random 
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Affine registrace do MNI přes Slicer BRAINSFit (batch, paralelně).
+#
+# Použití:
+#   register_affine_to_MNI <INPUT_DIR> <OUTPUT_DIR> --fixed <MNIGMS.nii> [--jobs N] [--overwrite] [--tmp /tmp] [--ext ".nii,.nii.gz"]
+#
+# Poznámky:
+#   - Volá se tvůj Slicer: použije proměnnou prostředí $SLICER (pokud není, zkusí 'Slicer' v PATH).
+#   - 4D/5D NIfTI → automaticky zredukuje na 3D (1. frame) přes Python + nibabel.
+#   - Paralelizace přes GNU parallel (když není k dispozici, jede sekvenčně).
+#   - Výstup: <stem>_affine_reg.nii.gz v OUTPUT_DIR (existující soubory přeskočí, ledaže --overwrite).
+#   - BRAINSFit parametry vychází z tvého původního skriptu.
+
+if [[ $# -lt 3 ]]; then
+  echo "Usage: $0 <INPUT_DIR> <OUTPUT_DIR> --fixed <MNIGMS.nii> [--jobs N] [--overwrite] [--tmp /tmp] [--ext \".nii,.nii.gz\"]" >&2
+  exit 2
+fi
+
+IN_DIR="$1"; shift
+OUT_DIR="$1"; shift
+
+FIXED=""
+JOBS=1
+OVERWRITE=0
+TMPDIR_DEFAULT="/tmp"
+EXTS=".nii,.nii.gz"
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fixed)     FIXED="$(readlink -f "$2")"; shift 2 ;;
+    --jobs)      JOBS="${2:-1}"; shift 2 ;;
+    --overwrite) OVERWRITE=1; shift ;;
+    --tmp)       TMPDIR_DEFAULT="${2:-/tmp}"; shift 2 ;;
+    --ext)       EXTS="${2:-.nii,.nii.gz}"; shift 2 ;;
+    *)           echo "[WARN] ignoring arg: $1" >&2; shift ;;
+  esac
 done
+
+if [[ -z "$FIXED" || ! -f "$FIXED" ]]; then
+  echo "[ERR] --fixed <MNIGMS.nii> je povinné a musí existovat." >&2
+  exit 2
+fi
+
+IN_DIR="$(readlink -f "$IN_DIR")"
+OUT_DIR="$(readlink -f "$OUT_DIR")"
+mkdir -p "$OUT_DIR"
+
+# Slicer launcher
+SLICER_BIN="${SLICER:-Slicer}"
+if ! command -v "$SLICER_BIN" >/dev/null 2>&1; then
+  echo "[ERR] Slicer nebyl nalezen. Nastav proměnnou SLICER na binárku Sliceru." >&2
+  exit 127
+fi
+
+# Seznam vstupů
+shopt -s nullglob
+mapfile -t FILES < <(
+  IFS=, read -ra exts <<< "$EXTS"
+  for ext in "${exts[@]}"; do
+    ext_trim="${ext// /}"
+    find "$IN_DIR" -maxdepth 1 -type f -name "*${ext_trim}"
+  done | sort
+)
+shopt -u nullglob
+
+TOTAL=${#FILES[@]}
+if [[ $TOTAL -eq 0 ]]; then
+  echo "[WARN] No NIfTI found in $IN_DIR (exts: $EXTS)"
+  exit 0
+fi
+
+# Helper: reduce 4D/5D -> 3D via nibabel
+reduce_multiframe_py() {
+python - "$1" "$2" <<'PY'
+import sys, nibabel as nib, numpy as np
+src, dst = sys.argv[1], sys.argv[2]
+img = nib.load(src)
+try:
+    ndim = img.ndim
+except AttributeError:
+    ndim = img.get_fdata().ndim
+data = img.get_fdata()
+aff  = img.affine
+hdr  = img.header.copy()
+if data.ndim <= 3:
+    nib.save(nib.Nifti1Image(data, aff, hdr), dst)
+    sys.exit(0)
+while data.ndim > 3:
+    data = np.take(data, 0, axis=-1)
+data = np.asarray(data, dtype=np.float32)
+nib.save(nib.Nifti1Image(data, aff, hdr), dst)
+PY
+}
+
+register_one() {
+  in="$1"; outdir="$2"; overwrite="$3"; tmpbase="$4"; fixed="$5"; slicer_bin="$6"
+
+  bn="$(basename "$in")"
+  stem="${bn%.nii.gz}"; stem="${stem%.nii}"
+  out="${outdir}/${stem}_affine_reg.nii.gz"
+
+  if [[ -e "$out" && "$overwrite" -eq 0 ]]; then
+    echo "[SKIP] $out"
+    return 0
+  fi
+
+  # zjisti rychle počet dimenzí (bez heavy load)
+  ndim=$(python - "$in" <<'PY'
+import sys, nibabel as nib
+img = nib.load(sys.argv[1])
+try:
+  print(img.ndim)
+except AttributeError:
+  print(img.get_fdata().ndim)
+PY
+) || ndim=3
+
+  tmpin="$in"
+  tmpd=""
+  if [[ "$ndim" -gt 3 ]]; then
+    tmpd="$(mktemp -d -p "$tmpbase" reg_XXXXXX)"
+    tmpin="${tmpd}/${stem}_frame0.nii.gz"
+    echo "[INFO] ${bn}: ndim=${ndim} → beru 1. frame přes nibabel"
+    if ! reduce_multiframe_py "$in" "$tmpin" >/dev/null 2>&1; then
+      echo "[ERR] ${bn}: redukce 5D/4D selhala, přeskočeno"
+      [[ -n "$tmpd" ]] && rm -rf "$tmpd"
+      return 0
+    fi
+  fi
+
+  echo "[RUN] BRAINSFit ${bn} → ${out}"
+  if ! "$slicer_bin" --launch BRAINSFit \
+      --fixedVolume "$fixed" \
+      --movingVolume "$tmpin" \
+      --samplingPercentage 0.01 \
+      --splineGridSize 14,10,12 \
+      --outputVolume "$out" \
+      --initializeTransformMode useCenterOfHeadAlign \
+      --useAffine \
+      --maskProcessingMode NOMASK \
+      --medianFilterSize 0,0,0 \
+      --removeIntensityOutliers 0 \
+      --outputVolumePixelType float \
+      --backgroundFillValue 0 \
+      --interpolationMode Linear \
+      --numberOfIterations 1500 \
+      --maximumStepLength 0.05 \
+      --minimumStepLength 0.001 \
+      --relaxationFactor 0.5 \
+      --translationScale 1000 \
+      --reproportionScale 1 \
+      --skewScale 1 \
+      --maxBSplineDisplacement 0 \
+      --fixedVolumeTimeIndex 0 \
+      --movingVolumeTimeIndex 0 \
+      --numberOfHistogramBins 50 \
+      --numberOfMatchPoints 10 \
+      --costMetric MMI \
+      --maskInferiorCutOffFromCenter 1000 \
+      --ROIAutoDilateSize 0 \
+      --ROIAutoClosingSize 9 \
+      --numberOfSamples 0 \
+      --failureExitCode -1 \
+      --numberOfThreads -1 \
+      --debugLevel 7 \
+      --costFunctionConvergenceFactor 2e+13 \
+      --projectedGradientTolerance 1e-05 \
+      --maximumNumberOfEvaluations 900 \
+      --maximumNumberOfCorrections 25 \
+      --metricSamplingStrategy Random \
+      >/dev/null; then
+    echo "[ERR] BRAINSFit selhal pro: $bn"
+    [[ -n "$tmpd" ]] && rm -rf "$tmpd"
+    return 1
+  fi
+
+  [[ -n "$tmpd" ]] && rm -rf "$tmpd"
+  echo "[OK] $out"
+  return 0
+}
+export -f register_one reduce_multiframe_py
+
+# Paralelně, pokud je GNU parallel
+if command -v parallel >/dev/null 2>&1 && [[ "$JOBS" -gt 1 ]]; then
+  parallel -j "$JOBS" register_one {} "$OUT_DIR" "$OVERWRITE" "$TMPDIR_DEFAULT" "$FIXED" "$SLICER_BIN" ::: "${FILES[@]}"
+else
+  for f in "${FILES[@]}"; do
+    register_one "$f" "$OUT_DIR" "$OVERWRITE" "$TMPDIR_DEFAULT" "$FIXED" "$SLICER_BIN" || true
+  done
+fi
+
+echo "[OK] registration to MNI → $OUT_DIR"

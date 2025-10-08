@@ -1,11 +1,22 @@
-# export_series_metadata.py
+#!/usr/bin/env python3
+"""
+Export all DICOM Study/Series metadata from the current 3D Slicer DICOM database
+into a single CSV. This version RESPECTS the --output path passed from the CLI
+(e.g., via Makefile) instead of saving to a hard-coded filename.
+
+Usage (inside Slicer):
+  Slicer --no-splash --python-script /path/to/export_series_metadata.py -- \
+    --output /absolute/path/to/outputs/metadata/all_series_metadata.csv
+"""
 import re
+import os
+import argparse
 import slicer
 import pandas as pd
 import pydicom
 from pydicom.multival import MultiValue
 
-# ---------- malé helpy ----------
+# ---------- helpers ----------
 def fmt_date(date_str):
     # YYYYMMDD → YYYY-MM-DD
     if date_str and isinstance(date_str, str) and len(date_str) == 8:
@@ -32,7 +43,7 @@ def as_float(x, default=None):
         return default
 
 def tm_to_seconds(tm):
-    """DICOM TM (HHMMSS.frac) -> sekundy od půlnoci."""
+    """DICOM TM (HHMMSS.frac) -> seconds since midnight."""
     if not tm:
         return None
     s = str(tm)
@@ -45,13 +56,13 @@ def tm_to_seconds(tm):
         return None
 
 def minutes_diff(t_start, t_end):
-    """Rozdíl v minutách mezi dvěma TM; pokud přeteče přes půlnoc, přičte 24h."""
+    """Difference in minutes between two TM; if wrap past midnight, add 24h."""
     s1 = tm_to_seconds(t_start)
     s2 = tm_to_seconds(t_end)
     if s1 is None or s2 is None:
         return None
     d = s2 - s1
-    if d < -12 * 3600:  # přetečení přes půlnoc
+    if d < -12 * 3600:  # wrap over midnight
         d += 24 * 3600
     return d / 60.0
 
@@ -69,7 +80,7 @@ def parse_corrected_flags(ds):
     return flags
 
 def parse_energy_windows(ds):
-    """0054,0011 EnergyWindowInformationSequence → lower/upper keV (první okno)."""
+    """0054,0011 EnergyWindowInformationSequence → lower/upper keV (first window)."""
     low = None
     up  = None
     try:
@@ -84,7 +95,7 @@ def parse_energy_windows(ds):
     return low, up
 
 def parse_recon_text_fields(ds):
-    """Slepí text z různých polí (Series/Protocol/ImageComments/Software/Private)."""
+    """Concatenate text from several fields (Series/Protocol/Comments/Software/Private)."""
     parts = []
     for key in ["SeriesDescription", "ProtocolName", "ImageComments",
                 "Manufacturer", "ManufacturerModelName", "SoftwareVersions",
@@ -92,7 +103,7 @@ def parse_recon_text_fields(ds):
         v = ds.get(key, None)
         if v:
             parts.append(as_str(v))
-    # fallback: projdi ds a chyť textové private položky s 'recon', 'iter', 'subset', 'filter', 'fwhm', 'tof', 'psf', 'q.clear'
+    # fallback: scan ds for private text with recon keywords
     hay = []
     try:
         for name in ds.dir():
@@ -106,41 +117,36 @@ def parse_recon_text_fields(ds):
     return txt
 
 def parse_recon_features(txt):
-    """Heuristické parsování PSF/TOF, iterací, subsets, filtrů/FWHM, Q.Clear bety."""
+    """Heuristic parsing of PSF/TOF, iterations, subsets, filters/FWHM, Q.Clear beta."""
     if not txt:
         txt = ""
     low = txt.lower()
     has_tof  = bool(re.search(r"\btof\b|time[-\s]?of[-\s]?flight|\btf\b", low))
     has_psf  = bool(re.search(r"\bpsf\b|truex|resolution\s*recovery", low))
     has_qclr = bool(re.search(r"q\.?clear", low))
-    # iterace
     it = None
     m = re.search(r"(\d+)\s*(?:i\b|iter|iterations)", low)
     if m: it = int(m.group(1))
-    # subsety
     sb = None
     m = re.search(r"(\d+)\s*(?:s\b|subset|subsets)", low)
     if m: sb = int(m.group(1))
-    # filtr / FWHM
     filter_type = None
     if re.search(r"gauss|gaussian", low): filter_type = "Gaussian"
     elif re.search(r"butterworth", low):  filter_type = "Butterworth"
     elif re.search(r"hann|hanning", low): filter_type = "Hann"
-    # FWHM číslo v mm (např. 'FWHM 4.0' nebo 'Gauss2.0')
     fwhm = None
     m = re.search(r"fwhm[^0-9]*?(\d+(\.\d+)?)", low)
     if not m:
         m = re.search(r"gauss[^0-9]*?(\d+(\.\d+)?)", low)
     if m:
         fwhm = float(m.group(1))
-    # Q.Clear beta
     qbeta = None
     m = re.search(r"q\.?clear[^0-9]*?(\d+(\.\d+)?)", low)
     if m:
         qbeta = float(m.group(1))
     return has_psf, has_tof, has_qclr, it, sb, filter_type, fwhm, qbeta
 
-# ---------- hlavní export ----------
+# ---------- core export ----------
 def export_patient_study_series_metadata(output_csv_path):
     db = slicer.dicomDatabase
     rows = []
@@ -154,7 +160,7 @@ def export_patient_study_series_metadata(output_csv_path):
                 fname = files[0]
                 ds = pydicom.dcmread(fname, stop_before_pixels=True)
 
-                # Základ pacienta
+                # Patient basics
                 pn = ds.get("PatientName", None)
                 family = getattr(pn, "family_name", "") if pn else ""
                 given  = getattr(pn, "given_name", "")  if pn else ""
@@ -183,7 +189,7 @@ def export_patient_study_series_metadata(output_csv_path):
                 sw_versions   = ds.get("SoftwareVersions", "")
                 image_type    = as_str(ds.get("ImageType", ""))
 
-                # Geometrie
+                # Geometry
                 rows_i        = as_float(ds.get("Rows", None))
                 cols_i        = as_float(ds.get("Columns", None))
                 pxs           = ds.get("PixelSpacing", None)
@@ -196,7 +202,7 @@ def export_patient_study_series_metadata(output_csv_path):
                 if px_x and px_y and sl_thick:
                     voxel_vol = px_x * px_y * sl_thick  # mm^3
 
-                # PET specifické
+                # PET specifics
                 units         = ds.get("Units", "")
                 decay_corr    = ds.get("DecayCorrection", "")
                 act_frame_dur = as_float(ds.get("ActualFrameDuration", None))  # ms
@@ -207,7 +213,7 @@ def export_patient_study_series_metadata(output_csv_path):
                 patient_size  = as_float(ds.get("PatientSize", None))
                 patient_weight= as_float(ds.get("PatientWeight", None))
 
-                # Radiopharm seq → dávka/half-life/čas
+                # Radiopharm seq → dose / half-life / start time
                 radiopharm            = ""
                 radiopharm_start_time = ""
                 total_dose            = None
@@ -219,7 +225,7 @@ def export_patient_study_series_metadata(output_csv_path):
                     total_dose            = as_float(getattr(info, "RadionuclideTotalDose", None))
                     half_life             = as_float(getattr(info, "RadionuclideHalfLife", None))
 
-                # Uptake time (min) – od startu aplikace do SeriesTime (fallback AcquisitionTime)
+                # Uptake time (min) – from injection start to SeriesTime (fallback AcquisitionTime)
                 series_tm = series_time or acq_time
                 uptake_min = minutes_diff(radiopharm_start_time, series_tm)
 
@@ -230,16 +236,16 @@ def export_patient_study_series_metadata(output_csv_path):
                 recon_text = parse_recon_text_fields(ds)
                 has_psf, has_tof, has_qclr, iters, subsets, filt_type, fwhm, qbeta = parse_recon_features(recon_text)
 
-                # CT-AC parametry (když je to CT série)
+                # CT-AC parameters (if CT series)
                 kvp           = as_float(ds.get("KVP", None))
                 conv_kernel   = as_str(ds.get("ConvolutionKernel", ""))
 
-                # škálování (QA)
+                # QA scaling
                 rescale_slope     = as_float(ds.get("RescaleSlope", None))
                 rescale_intercept = as_float(ds.get("RescaleIntercept", None))
 
                 rows.append({
-                    # pacient
+                    # patient
                     "PatientFamilyName":        family,
                     "PatientGivenName":         given,
                     "PatientID":                patient_id,
@@ -263,13 +269,13 @@ def export_patient_study_series_metadata(output_csv_path):
                     "Modality":                 modality,
                     "ImageType":                image_type,
 
-                    # identita zařízení/SW
+                    # device/software identity
                     "Manufacturer":             as_str(manuf),
                     "ManufacturerModelName":    as_str(model_name),
                     "SoftwareVersions":         as_str(sw_versions),
                     "StationName":              as_str(station_name),
 
-                    # PET specifika
+                    # PET specifics
                     "Units":                    as_str(units),
                     "DecayCorrection":          as_str(decay_corr),
                     "ActualFrameDuration_s":    (act_frame_dur/1000.0 if act_frame_dur else None),
@@ -284,7 +290,7 @@ def export_patient_study_series_metadata(output_csv_path):
                     "RadionuclideHalfLife_s":   half_life,
                     "UptakeTime_min":           uptake_min,
 
-                    # Geometrie
+                    # geometry
                     "Rows":                     rows_i,
                     "Columns":                  cols_i,
                     "PixelSpacingX_mm":         px_x,
@@ -297,7 +303,7 @@ def export_patient_study_series_metadata(output_csv_path):
                     # CorrectedImage flags
                     **corr_flags,
 
-                    # Heuristiky rekonstrukce
+                    # recon heuristics
                     "ReconText":                recon_text,
                     "HasTOF":                   has_tof,
                     "HasPSF":                   has_psf,
@@ -308,7 +314,7 @@ def export_patient_study_series_metadata(output_csv_path):
                     "FilterFWHM_mm":            fwhm,
                     "QClearBeta":               qbeta,
 
-                    # CT-AC (když Modality==CT, jinak prázdné)
+                    # CT-AC (if Modality==CT, else empty)
                     "CT_KVP":                   kvp,
                     "CT_ConvolutionKernel":     conv_kernel,
 
@@ -316,14 +322,28 @@ def export_patient_study_series_metadata(output_csv_path):
                     "RescaleSlope":             rescale_slope,
                     "RescaleIntercept":         rescale_intercept,
 
-                    # UID pro join
+                    # UIDs for joins
                     "StudyInstanceUID":         as_str(ds.get("StudyInstanceUID","")),
                     "SeriesInstanceUID":        as_str(ds.get("SeriesInstanceUID",""))
                 })
 
     df = pd.DataFrame(rows)
-    df.to_csv(output_csv_path, index=False, encoding="utf-8")
-    print(f"Exportováno {len(df)} řádků do {output_csv_path}")
+    return df
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--output', required=True, help='Output CSV path')
+    args, _ = ap.parse_known_args()
+
+    out_path = os.path.abspath(args.output)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    df = export_patient_study_series_metadata(out_path)
+    df.to_csv(out_path, index=False, encoding='utf-8')
+    print(f"Exportováno {len(df)} řádků do {out_path}")
+
 
 if __name__ == "__main__":
-    export_patient_study_series_metadata("all_series_metadata_export_08092025.csv")
+    main()
+    slicer.util.exit()

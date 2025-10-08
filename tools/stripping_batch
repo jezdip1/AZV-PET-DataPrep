@@ -1,9 +1,143 @@
-#!/bin/bash
-# NOTE : Quote it else use array to avoid problems #
-FILES="./*.nii"
-for f in $FILES
-do
-  echo "running ./synthstrip-docker -i ${f} -o ${f::-4}_stripped.nii"
-  # take action on each file. $f store current file name
-  ./synthstrip-docker -i $f -o "${f::-4}_stripped.nii"
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Batch skull-stripping přes původní synthstrip-docker (vedle tohoto skriptu).
+# Usage:
+#   tools/stripping_batch <INPUT_DIR> <OUTPUT_DIR> [--overwrite] [--jobs N] [--ext ".nii,.nii.gz"] [--tmp /tmp]
+#
+# - Bez FSL: 4D/5D NIfTI → automaticky zredukuje na první frame přes Python+nibabel.
+# - Pokud výstup existuje a není --overwrite, soubor přeskočí.
+# - Paralelně běží přes GNU parallel, ale NEpřeruší se na první fail.
+# - Summary se počítá podle počtu vytvořených *_stripped.nii.gz v OUT_DIR.
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 <INPUT_DIR> <OUTPUT_DIR> [--overwrite] [--jobs N] [--ext \".nii,.nii.gz\"] [--tmp /tmp]" >&2
+  exit 2
+fi
+
+IN_DIR="$1"; shift
+OUT_DIR="$1"; shift
+OVERWRITE=0
+JOBS=1
+EXTS=".nii,.nii.gz"
+TMPDIR_DEFAULT="/tmp"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --overwrite) OVERWRITE=1; shift ;;
+    --jobs)      JOBS="${2:-1}"; shift 2 ;;
+    --ext)       EXTS="${2:-.nii,.nii.gz}"; shift 2 ;;
+    --tmp)       TMPDIR_DEFAULT="${2:-/tmp}"; shift 2 ;;
+    *)           echo "[WARN] ignoring arg: $1" >&2; shift ;;
+  esac
 done
+
+IN_DIR="$(readlink -f "$IN_DIR")"
+OUT_DIR="$(readlink -f "$OUT_DIR")"
+mkdir -p "$OUT_DIR"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_SS="${SCRIPT_DIR}/synthstrip-docker"
+if [[ ! -x "$RUN_SS" ]]; then
+  echo "[ERR] Nenalezen/nespustitelný: $RUN_SS" >&2
+  exit 127
+fi
+
+# Sežeň vstupy
+shopt -s nullglob
+mapfile -t FILES < <(cd "$IN_DIR" && printf '%s\0' *.nii *.nii.gz 2>/dev/null | xargs -0 -I{} echo "$IN_DIR/{}")
+shopt -u nullglob
+TOTAL=${#FILES[@]}
+if [[ $TOTAL -eq 0 ]]; then
+  echo "[WARN] V $IN_DIR nejsou žádné .nii ani .nii.gz"
+  exit 0
+fi
+
+# Funkce: vyrob single-frame přes nibabel (pokud je 4D/5D)
+reduce_multiframe() {
+  local in="$1"
+  local out="$2"
+  python - "$in" "$out" <<'PY'
+import sys, nibabel as nib, numpy as np, os
+src, dst = sys.argv[1], sys.argv[2]
+img = nib.load(src)
+data = img.get_fdata()
+aff  = img.affine
+hdr  = img.header.copy()
+# squeeze, ale garantuj 3D
+if data.ndim <= 3:
+    nib.save(nib.Nifti1Image(data, aff, hdr), dst)
+    sys.exit(0)
+# postupně ber první index navíc, dokud nezůstane 3D
+while data.ndim > 3:
+    data = np.take(data, 0, axis=-1)
+# jistota float32 kvůli velikosti
+data = np.asarray(data, dtype=np.float32)
+nib.save(nib.Nifti1Image(data, aff, hdr), dst)
+PY
+}
+
+process_one() {
+  local in="$1"
+  local outdir="$2"
+  local overwrite="$3"
+  local tmpbase="$4"
+  local run_ss="$5"
+
+  local bn stem out
+  bn="$(basename "$in")"
+  stem="${bn%.nii.gz}"; stem="${stem%.nii}"
+  out="${outdir}/${stem}_stripped.nii.gz"
+
+  if [[ -e "$out" && "$overwrite" -eq 0 ]]; then
+    echo "[SKIP] $out už existuje"
+    return 0
+  fi
+
+  # Zjisti počet dimenzí přes nibabel (rychlé)
+  local ndim tmpd tmpin
+  ndim=$(python - "$in" <<'PY'
+import sys, nibabel as nib
+img = nib.load(sys.argv[1])
+print(img.ndim if hasattr(img,'ndim') else img.get_fdata().ndim)
+PY
+)
+  tmpin="$in"
+  if [[ "$ndim" -gt 3 ]]; then
+    tmpd="$(mktemp -d -p "$tmpbase" strip_XXXXXX)"
+    tmpin="${tmpd}/${stem}_frame0.nii.gz"
+    echo "[INFO] ${bn}: ndim=${ndim} → beru 1. frame přes nibabel"
+    if ! reduce_multiframe "$in" "$tmpin" >/dev/null 2>&1; then
+      echo "[ERR] ${bn}: redukce 5D/4D selhala, přeskočeno"
+      rm -rf "$tmpd"
+      return 0
+    fi
+  fi
+
+  echo "[RUN] $run_ss -i \"$tmpin\" -o \"$out\""
+  if ! "$run_ss" -i "$tmpin" -o "$out"; then
+    echo "[ERR] SynthStrip selhal pro: $bn"
+    [[ "$tmpin" != "$in" ]] && rm -rf "$(dirname "$tmpin")" || true
+    return 1
+  fi
+
+  [[ "$tmpin" != "$in" ]] && rm -rf "$(dirname "$tmpin")" || true
+  echo "[OK] $out"
+  return 0
+}
+export -f process_one reduce_multiframe
+
+# Paralelně, ale bez --halt (ať to dojede)
+if [[ "$JOBS" -gt 1 ]] && command -v parallel >/dev/null 2>&1; then
+  parallel -j "$JOBS" process_one {} "$OUT_DIR" "$OVERWRITE" "$TMPDIR_DEFAULT" "$RUN_SS" ::: "${FILES[@]}"
+else
+  for f in "${FILES[@]}"; do
+    process_one "$f" "$OUT_DIR" "$OVERWRITE" "$TMPDIR_DEFAULT" "$RUN_SS" || true
+  done
+fi
+
+# Summary podle počtu výstupů
+OKS=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*_stripped.nii.gz' | wc -l)
+FAILS=$(( TOTAL - OKS ))
+echo "[SUMMARY] OK: ${OKS} / ${TOTAL}, FAILS: ${FAILS}"
+exit 0
