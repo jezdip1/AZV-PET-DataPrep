@@ -258,9 +258,39 @@ def main():
         # Fall back to best-effort join using filename stem if needed
         print('[WARN] metadata has no SeriesInstanceUID; join may be partial')
     full = df_metrics.merge(meta, on=join_key, how='left', suffixes=('', '_meta'))
+    # ---- Derived columns to match old training inputs ----
+    import numpy as np
 
+    def _as_num(s):
+        return pd.to_numeric(full.get(s, np.nan), errors='coerce')
+
+    # logAcqDur_s = log(ActualFrameDuration_s)
+    if 'ActualFrameDuration_s' in full.columns:
+        full['logAcqDur_s'] = np.log(np.clip(_as_num('ActualFrameDuration_s'), 1e-12, None))
+
+    # (volitelné) logVoxelVol = log(VoxelVolume_mm3)
+    if 'VoxelVolume_mm3' in full.columns:
+        full['logVoxelVol'] = np.log(np.clip(_as_num('VoxelVolume_mm3'), 1e-12, None))
+
+    # binarizace flagů na 0/1 (stejně jako v původním skriptu)
+    def _to_bin(col):
+        if col not in full.columns: 
+            return
+        x = full[col].astype(str).str.lower().str.strip()
+        full[col] = x.isin(['1','true','t','yes','y']).astype(float)
+
+    for nm in [
+        'HasTOF','HasPSF','HasQClear',
+        'corr_ATTN','corr_SCAT','corr_NORM','corr_DECY','corr_DTIM','corr_RAN','corr_DRFT','corr_GEO','corr_PVC'
+    ]:
+        _to_bin(nm)
+
+    # Uložení
     full.to_csv(out_csv, index=False)
     print(f"[OK] wrote {out_csv} (rows={len(full)}, cols={len(full.columns)})")
+
+#   full.to_csv(out_csv, index=False)
+ #   print(f"[OK] wrote {out_csv} (rows={len(full)}, cols={len(full.columns)})")
 
 if __name__ == '__main__':
     main()
